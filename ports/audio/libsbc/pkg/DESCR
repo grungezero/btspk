@@ -1,0 +1,3 @@
+SBC (low-complexity subband codec) is an audio codec used by Bluetooth
+A2DP devices, including headphones and speakers. This package contains
+the shared library and development header for applications using SBC.

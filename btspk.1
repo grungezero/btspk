@@ -1,0 +1,284 @@
+.Dd November 25, 2026
+.Dt BTSPK 1
+.Os
+.Sh NAME
+.Nm btspk
+.Nd play audio from sndio on a Bluetooth A2DP device
+.Sh SYNOPSIS
+.Nm
+.Op Fl EJSqv
+.Op Fl f Ar firmware.sfi
+.Op Fl u Ar unit
+.Ar info | reset | scan | upload
+.Pp
+.Nm
+.Op Fl JSqv
+.Op Fl F Ar ms
+.Op Fl b Ar ms
+.Op Fl d Ar device
+.Op Fl n Ar frames
+.Op Fl u Ar unit
+.Ar play Ar bdaddr
+.Sh DESCRIPTION
+.Nm
+is a userland Bluetooth A2DP client for OpenBSD.
+It communicates with a Bluetooth controller through
+.Xr ugen 4 ,
+implements the HCI, ACL, L2CAP and AVDTP protocol paths required for
+A2DP playback, encodes PCM audio with SBC, and obtains audio from
+.Xr sndio 7 .
+.Pp
+The default sndio device is
+.Pa snd/mon .
+The device must provide 16-bit, signed, little-endian, two-channel
+PCM at the sample rate selected during A2DP negotiation.
+.Pp
+.Nm
+is intended to operate with Intel USB Bluetooth controllers.
+The controller is accessed through
+.Pa /dev/ugen
+endpoints.
+The normal playback process is pledged with
+.Xr pledge 2
+and its filesystem namespace is restricted with
+.Xr unveil 2 .
+USB operations which cannot be authorized by
+.Xr pledge 2
+are handled by a small helper process through a restricted Unix-domain
+socket protocol.
+.Pp
+Unless
+.Fl S
+is specified, authentication and encryption are required before the
+A2DP connection is established.
+New pairings require authenticated Secure Simple Pairing with numeric
+comparison.
+.Fl J
+explicitly permits Just Works pairing without MITM protection.
+.Sh OPTIONS
+The following options are available:
+.Bl -tag -width Ds
+.It Fl E
+Use the ECDSA Intel firmware image layout when loading firmware.
+The default is the RSA layout.
+.It Fl F Ar ms
+Set the Bluetooth ACL flush timeout in milliseconds.
+The valid range is 0 through 1000.
+A value of 0 disables the flush timeout.
+The default is 100 milliseconds.
+.It Fl J
+Explicitly allow Just Works pairing.
+This pairing method does not provide MITM protection.
+The option is mutually exclusive with
+.Fl S .
+Unauthenticated link keys are accepted and may be stored for later use.
+.It Fl S
+Skip Bluetooth authentication and encryption.
+This is intended for diagnostics only.
+The option is mutually exclusive with
+.Fl J .
+.It Fl b Ar ms
+Set the sndio application buffer size in milliseconds.
+The valid range is 10 through 60000.
+The default is 30 milliseconds.
+.It Fl d Ar device
+Use the specified sndio device.
+Only
+.Pa snd/
+devices are accepted.
+The default is
+.Pa snd/mon .
+.It Fl f Ar firmware.sfi
+Specify an Intel
+.Pa .sfi
+firmware image.
+The image is used when the controller is in its bootloader and
+firmware loading is required, or with the
+.Ar upload
+command.
+.It Fl n Ar frames
+Set the number of SBC frames placed in each RTP packet.
+The valid range is 1 through 15.
+The default is 2.
+.It Fl q
+Suppress informational output and non-fatal warnings.
+Fatal errors remain visible.
+The Secure Simple Pairing numeric-comparison prompt is not suppressed.
+.It Fl u Ar unit
+Use the specified
+.Xr ugen 4
+unit.
+The default is 0.
+.It Fl v
+Enable verbose diagnostic output, including protocol tracing.
+.El
+.Sh COMMANDS
+The following commands are available:
+.Bl -tag -width Ds
+.It Ar info
+Read and display Intel controller firmware information and boot
+parameters.
+.It Ar reset
+Send the Intel controller back to its bootloader.
+After the reset, the controller may appear under a different
+.Xr ugen 4
+unit.
+.It Ar scan
+Perform a Bluetooth inquiry and display discovered devices, their
+class of device and remote name when available.
+.It Ar upload
+Load the firmware specified by
+.Fl f
+into a controller which is already in its bootloader.
+.It Ar play Ar bdaddr
+Establish an ACL connection to the Bluetooth device identified by
+.Ar bdaddr ,
+negotiate an A2DP SBC stream, and play audio captured from sndio.
+The Bluetooth address is written in the usual
+.Qq xx:xx:xx:xx:xx:xx
+form.
+.El
+.Sh SECURITY
+.Nm
+uses several independent OpenBSD security mechanisms.
+.Pp
+The default Bluetooth pairing policy requires authenticated Secure
+Simple Pairing.
+The local IO capability is advertised as DisplayYesNo, and numeric
+comparison requires explicit confirmation through
+.Pa /dev/tty .
+Authenticated combination link keys are accepted for subsequent
+connections.
+.Pp
+.Fl J
+is an explicit exception to this policy.
+It selects NoInputNoOutput capabilities and permits Just Works pairing.
+Just Works provides no MITM protection and should only be used when
+that limitation is acceptable.
+.Pp
+.Fl S
+is a stronger diagnostic exception: it bypasses authentication and
+encryption entirely.
+It should not be used on an untrusted Bluetooth link.
+.Pp
+Link-key files are kept in
+.Pa ~/.btspk_keys .
+The file must be a regular file owned by the invoking user and must
+not be accessible to group or other users.
+The file is created with restrictive permissions.
+Link-key material is cleared from temporary buffers after use.
+.Pp
+The main process is pledged after controller setup.
+For playback it initially permits:
+.Bd -literal -offset indent
+stdio rpath wpath cpath unix tty audio
+.Ed
+.Pp
+After
+.Xr sio_open 3
+has connected to sndiod, the pledge is reduced to:
+.Bd -literal -offset indent
+stdio unix audio
+.Ed
+.Pp
+The
+.Xr audio 4
+promise is required by
+.Xr sio_open 3
+even when the selected device is an sndiod device rather than a
+direct
+.Pa /dev/audio
+device.
+.Pp
+The scan path uses the narrower:
+.Bd -literal -offset indent
+stdio unix
+.Ed
+.Pp
+The USB helper is deliberately not pledged because the required
+.Xr ugen 4
+USB ioctl operations are not covered by a generic pledge promise.
+It accepts only the fixed operations required by
+.Nm ,
+validates HCI command opcodes and lengths, bounds USB transfer data,
+and does not accept caller-supplied ioctl numbers.
+.Pp
+The filesystem namespace is restricted with
+.Xr unveil 2 .
+The user's home directory is available for the link-key file,
+.Pa /dev/tty
+is available for numeric comparison, and
+.Pa /tmp/sndio
+is available for the local sndiod connection.
+The unveil namespace is locked before normal protocol processing.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.btspk_keys
+Per-user Bluetooth link keys.
+.It Pa /dev/ugen Ns Ar unit Ns Pa . Ns Ar endpoint
+USB controller endpoints used for HCI and ACL transport.
+.It Pa /dev/tty
+Used for authenticated Secure Simple Pairing numeric comparison.
+.It Pa /tmp/sndio
+sndiod Unix-domain socket directory used by sndio devices.
+.El
+.Sh EXAMPLES
+Play audio through the default sndio device:
+.Bd -literal -offset indent
+doas btspk play 04:fe:a1:8c:3a:fb
+.Ed
+.Pp
+Allow Just Works pairing explicitly:
+.Bd -literal -offset indent
+doas btspk -J play 04:fe:a1:8c:3a:fb
+.Ed
+.Pp
+Scan for Bluetooth devices:
+.Bd -literal -offset indent
+doas btspk scan
+.Ed
+.Pp
+Inspect the Intel controller:
+.Bd -literal -offset indent
+doas btspk info
+.Ed
+.Pp
+Upload firmware to a controller in its bootloader:
+.Bd -literal -offset indent
+doas btspk -f ibt-19-0-4.sfi upload
+.Ed
+.Pp
+Run with reduced output:
+.Bd -literal -offset indent
+doas btspk -q play 04:fe:a1:8c:3a:fb
+.Ed
+.Sh EXIT STATUS
+.Ex -std
+.Sh DIAGNOSTICS
+.Nm
+reports fatal errors on standard error and exits non-zero.
+With
+.Fl q ,
+informational output and non-fatal warnings are suppressed.
+.Sh SEE ALSO
+.Xr pledge 2 ,
+.Xr unveil 2 ,
+.Xr ugen 4 ,
+.Xr sndio 7
+.Sh AUTHORS
+The Intel firmware loading path follows the design of
+.Nm iwmbtfw ,
+including firmware fragment handling.
+.Sh CAVEATS
+The Intel firmware loader is specific to the controller firmware format
+implemented by
+.Nm .
+The Bluetooth controller must be accessible through
+.Xr ugen 4 ,
+and the selected sndio device must provide the PCM parameters required
+by the negotiated SBC stream.
+.Pp
+Firmware loading and controller reset can cause the USB device to
+reappear under a different
+.Xr ugen 4
+unit.

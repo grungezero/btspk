@@ -1,0 +1,6 @@
+include/sbc/
+include/sbc/sbc.h
+@static-lib lib/libsbc.a
+lib/libsbc.la
+@lib lib/libsbc.so.${LIBsbc_VERSION}
+lib/pkgconfig/sbc.pc
