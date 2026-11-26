@@ -1,474 +1,394 @@
 # btspk
 
-`btspk` is an OpenBSD userland Bluetooth A2DP audio client. It talks
- directly to an Intel Bluetooth USB controller through `ugen(4)`, implements
-the host-side Bluetooth protocols needed for A2DP, encodes audio with
-`libsbc`, and uses `sndio`/`sndiod` for PCM input.
+`btspk` is a userland Bluetooth audio client for Intel Bluetooth
+controllers. It uses the USB interface exposed by OpenBSD, implements
+the required Bluetooth control and audio protocols in userland, and
+sends audio through `sndio`.
 
-The project is intentionally implemented entirely in userland. OpenBSD does
-not provide an in-kernel Bluetooth stack, so `btspk` implements the required
-Bluetooth host protocols itself and talks directly to the Bluetooth USB
-controller through `ugen(4)`.
+This document describes the security mechanisms present in
+`btspk-secure-hardened-v12.c`. It is a description of that source
+revision, not a security certification or a claim that every path has
+been audited.
 
 ## Security model
 
-Security is divided into three layers:
+The design separates privileged device setup from the normal Bluetooth
+protocol process:
 
-```text
-                    btspk
-                      |
-        +-------------+-------------+
-        |                           |
-        v                           v
-   pledge(2)                    unveil(2)
-   syscall policy               filesystem policy
-        |                           |
-        |                           +-- $HOME / .btspk_keys
-        |                           +-- /dev/tty
-        |                           +-- /tmp/sndio
-        |
-        +-------------------+
-        |                   |
-        v                   v
-  pledged main          USB ioctl broker
-  process               (small helper)
-        |                   |
-        | HCI/L2CAP/        | ugen(4) ioctls
-        | AVDTP/A2DP        |
-        | sndio              v
-        |                Intel USB
-        |                controller
-        v
-     Bluetooth
-       device
+1.  The initial process opens the USB device and performs Intel
+    controller setup and firmware loading when required.
+2.  For playback, it prepares the user's sndio directory.
+3.  It drops root privileges to the user who invoked `doas`.
+4.  In playback mode, it restricts filesystem visibility with
+    `unveil()`.
+5.  It starts a small USB helper process. The main process retains only
+    the helper socket for privileged USB operations; the helper owns the
+    USB control and bulk descriptors.
+6.  The main process applies `pledge()` and performs HCI, Bluetooth
+    protocol, pairing, and audio work.
+
+The helper is a deliberately narrow exception to the sandbox: OpenBSD
+has no `pledge` promise for the ugen USB ioctls used here. The helper is
+therefore not pledged. Its accepted operations are constrained by a
+fixed IPC protocol and validation before issuing ioctls.
+
+## Process and sandbox diagram
+
+The following diagram shows the intended privilege and syscall
+boundaries in the playback path.
+
+``` mermaid
+flowchart TD
+    A["Initial process<br/>root when invoked through doas"] --> B["USB open and Intel setup<br/>firmware handling if needed"]
+    B --> C["Prepare ~/.sndio"]
+    C --> D["Drop supplementary groups, GID and UID<br/>to DOAS_USER"]
+    D --> E["unveil filesystem paths<br/>then lock unveil"]
+    E --> F["Create socketpair and fork USB helper"]
+    F --> G["Main Bluetooth process"]
+    F --> H["USB helper process<br/>USB control + bulk descriptors"]
+    G --> I["pledge"]
+    I --> J["HCI / L2CAP / AVDTP<br/>pairing and audio"]
+    J --> K["sndio playback"]
+    G <-->|"fixed-size validated IPC"| H
+    H --> L["Validated ugen USB ioctls"]
+    style H fill:#fff2cc,stroke:#b8860b,color:#222
+    style I fill:#d9ead3,stroke:#38761d,color:#222
+    style E fill:#d9eaf7,stroke:#3d85c6,color:#222
 ```
 
-The important point is that `pledge(2)` and `unveil(2)` solve different
-problems. `pledge()` limits what classes of operations the process may perform,
-while `unveil()` limits which filesystem paths remain visible to it.
+**Important:** the USB helper is not inside the main process's `pledge`
+boundary. It is isolated by process separation and a restricted command
+interface, not by `pledge()`.
 
-### Why there is a USB helper
+## `unveil()` filesystem restrictions
 
-The normal protocol process is pledged, but the USB `ugen(4)` control and
-endpoint configuration ioctls used by this program are not covered by a
-suitable generic `pledge(2)` promise.
+The playback path calls `unveil()` after dropping privileges. It exposes
+only the paths needed by the playback process:
 
-Instead, `btspk` creates a small helper process after USB initialization:
+  ------------------------------------------------------------------------
+  Path                                   Permissions Purpose
+  --------------------- ---------------------------- ---------------------
+  `~/.sndio`                                   `rwc` sndio authentication
+                                                     cookie and related
+                                                     sndio state
 
-```text
-              main process
-                   |
-                   | fixed-size Unix socketpair
-                   | validated requests only
-                   v
-             USB helper
-             /        \
-            v          v
-       fd_control    fd_bulk
-            |          |
-            +-----+----+
-                  |
-                ugen(4)
-```
+  `~/.btspk`                                   `rwc` private Bluetooth
+                                                     link-key file
 
-The main process does **not** send arbitrary ioctl numbers to the helper.
-Requests are represented by a fixed internal message structure and the helper
-accepts only the operations required by the Bluetooth implementation.
+  `/dev/tty`                                    `rw` numeric-comparison
+                                                     confirmation prompt
 
-For HCI control transfers, the helper additionally checks the USB request type,
-request code, transfer length, HCI command length, and HCI opcode. Bulk
-configuration requests are restricted to the specific `ugen(4)` operations
-used by the program and bounded values.
+  `/tmp/sndio`                                   `w` connect to the local
+                                                     `sndiod` Unix-domain
+                                                     socket
+  ------------------------------------------------------------------------
 
-The helper is deliberately not pledged because it must issue the USB ioctls.
-It has no path-based filesystem access of its own; it inherits the descriptors
-needed for the USB operation and the IPC socket, and the parent closes its own
-USB control descriptor after the helper is started.
+After adding these paths, the program calls `unveil(NULL, NULL)` to lock
+the rules. Other filesystem paths are no longer available to the pledged
+playback process.
 
-## `pledge(2)`
+The key directory is created as `~/.btspk` with mode `0700` if it does
+not already exist. The code checks that it is a directory owned by the
+effective user and that group/other permission bits are clear.
 
-`btspk` uses pledge in stages rather than applying a single broad promise for
-the entire lifetime of the program.
+The sndio directory is prepared before dropping privileges. The code
+checks that it is a directory owned by the target user. It does not
+require the directory itself to have mode `0700`; the key directory has
+the stricter private-mode check.
 
-### Playback
+`unveil()` is applied only to the playback path. The source does not
+apply this filesystem sandbox to every command (for example, scan or
+firmware management).
 
-Before opening the sndio device, the main process uses:
+## `pledge()` syscall restrictions
 
-```c
+The main process applies `pledge()` after USB setup and after starting
+the USB helper.
+
+### Playback mode
+
+Initially, playback uses:
+
+``` c
 pledge("stdio rpath wpath cpath unix tty audio", NULL);
 ```
 
-This is the setup phase. The promises cover:
+These promises support standard I/O, sndio's cookie and filesystem
+handling, local Unix-domain socket communication, terminal confirmation,
+and audio.
 
-- `stdio` — normal file-descriptor I/O and basic process operations.
-- `rpath` — reading the link-key file and other required paths.
-- `wpath` — writing the persistent link-key file.
-- `cpath` — creating the link-key file when it does not exist.
-- `unix` — Unix-domain communication, including the sndiod connection and
-  the internal USB-helper socketpair.
-- `tty` — the explicit Numeric Comparison confirmation prompt on `/dev/tty`.
-- `audio` — required by OpenBSD's `sio_open(3)` path even when the selected
-  device is an `snd/...` sndiod device rather than a raw `/dev/audio` device.
+After `sio_open()` succeeds, the streaming path narrows the promises to:
 
-After `sio_open()` succeeds, the process narrows its pledge to:
-
-```c
+``` c
 pledge("stdio unix audio", NULL);
 ```
 
-At that point it no longer needs pathname access for normal streaming and no
-longer needs the `tty` promise. The process continues to use `unix` for the
-sndiod connection and the `audio` promise for the sndio API.
+This removes filesystem and terminal access from the streaming phase
+while retaining standard I/O, local IPC, and audio operations.
 
-### Scan and non-playback operation
+### Non-playback mode
 
-For operations that do not open an sndio playback device, the main process
-uses:
+Other commands use:
 
-```c
+``` c
 pledge("stdio unix", NULL);
 ```
 
-This is intentionally smaller than the playback setup promise.
+The USB helper is not pledged because the required ugen ioctls are not
+available through a pledge promise in this design.
 
-### What pledge protects
+## USB helper boundary
 
-`pledge()` is not a Bluetooth authentication mechanism and does not make the
-USB controller trustworthy. It is a post-setup syscall/operation sandbox.
+The helper is started with a Unix-domain `socketpair()` and `fork()`.
+The parent closes its USB control descriptor after the helper starts.
+Requests are sent as fixed-size IPC messages and receive fixed-size
+replies.
 
-For example, after the playback pledge is narrowed, code that unexpectedly
-tries to perform a filesystem pathname operation is outside the process's
-allowed promise set and is terminated by the kernel rather than being allowed
-to continue normally.
+The helper accepts only two operation classes:
 
-The security boundary is therefore:
+-   **USB control requests:** HCI command requests are checked for the
+    expected request type, request code, length, embedded HCI parameter
+    length, opcode, and opcode-specific parameter length. Endpoint-halt
+    clearing is limited to the known event and ACL endpoints.
+-   **Bulk endpoint ioctls:** only the supported timeout and
+    short-transfer controls are accepted, with bounded values. The
+    optional bulk read-ahead ioctl is similarly limited when available
+    at compile time.
 
-```text
-   application bug / compromised parser
-                  |
-                  v
-        +-------------------+
-        | pledged main      |
-        | process            |
-        +-------------------+
-          |       |       |
-          |       |       +-- no pathname operations after setup
-          |       +---------- no tty access after setup
-          +------------------ only promised operation classes
-```
+The HCI command whitelist is explicit. It includes the commands needed
+for inquiry, connection management, link-key replies/deletion,
+authentication, encryption, Secure Simple Pairing, Secure Connections,
+event masks, and buffer setup.
 
-The USB helper is a separate boundary. It is intentionally small because
-`pledge()` cannot be used to authorize the required USB ioctls in the main
-process.
+The helper does not parse Bluetooth packets or implement the Bluetooth
+protocol. Those operations remain in the main process.
 
-## `unveil(2)`
+The IPC messages and replies are cleared with `explicit_bzero()` after
+use. The helper closes its USB descriptors and exits when its IPC
+channel closes.
 
-`unveil()` provides the filesystem half of the sandbox. For playback,
-`btspk` resolves the user's home directory and key-file path before locking
-down filesystem visibility.
+## Privilege dropping
 
-The current playback sandbox is:
+When started with effective UID 0, the program requires `DOAS_USER` to
+identify the invoking user. It resolves that account, initializes the
+user's supplementary groups, then sets real/effective/saved GID and UID
+to the target user. It fails closed if the account cannot be resolved or
+the privilege drop fails.
 
-```text
-unveil($HOME,     "rwc")
-unveil(/dev/tty,   "rw")
-unveil(/tmp/sndio, "w")
-unveil(NULL,      NULL)       /* lock the policy */
-```
+The program also sets `HOME` to the target user's home directory.
 
-The meaning is:
+The USB device must be opened and any required privileged controller
+setup must happen before this drop. Normal HCI operation and playback
+then run as the invoking user.
 
-```text
-$HOME
-  |
-  +-- ~/.btspk_keys
-       read existing keys
-       create/update private key file
+## Bluetooth pairing and link security
 
-/dev/tty
-  |
-  +-- Numeric Comparison confirmation
+The normal pairing policy is designed to require MITM-protected pairing:
 
-/tmp/sndio
-  |
-  +-- sndiod Unix-domain socket
+-   Secure Simple Pairing is enabled on the controller.
+-   Secure Connections Host Support is enabled. Failure to enable either
+    mode aborts initialization.
+-   The local I/O capability is `DisplayYesNo`, with the MITM bit
+    requested.
+-   Numeric Comparison is accepted only when the remote I/O capability
+    is compatible (`DisplayYesNo` or `KeyboardDisplay`).
+-   The user must confirm the displayed six-digit number on the local
+    terminal. A rejected or unavailable confirmation aborts pairing.
+-   Passkey-entry requests are rejected because this implementation does
+    not provide a passkey-entry workflow. Passkey notification is also
+    rejected.
+-   Newly received link keys are saved by default only when the key type
+    is authenticated and the remote I/O capability supports Numeric
+    Comparison.
+-   If a received key does not meet the policy, the program asks the
+    controller to delete the stored key and removes the corresponding
+    local entry.
+-   After authentication and encryption, the program reads the
+    negotiated encryption key size and refuses a key shorter than 128
+    bits.
 
-Everything else
-  |
-  +-- hidden by unveil(2) after the policy is locked
-```
+### Explicitly weaker options
 
-The `/tmp/sndio` rule is important. `btspk` is an **sndiod client**, not a
-listener. When `sio_open("snd/mon", ...)` is used, sndio connects to the local
-sndiod Unix socket. The working OpenBSD configuration uses `/tmp/sndio` for
-that socket.
+Two options weaken the normal policy and should be treated as diagnostic
+or compatibility switches, not as secure defaults:
 
-`btspk` does not require direct `/dev/audio` access for the normal `snd/...`
-playback path.
+-   `-J` explicitly permits Just Works pairing. Just Works does not
+    provide MITM protection. The program prints a warning, requests no
+    MITM, and may save unauthenticated combination keys.
+-   `-S` skips authentication and encryption. It bypasses the normal
+    link security checks entirely.
 
-## Privilege separation and setup order
-
-The program may start with elevated privileges when invoked through `doas` so
-that it can open the USB controller and perform controller/firmware operations.
-For normal playback, it then drops to the invoking user before ordinary HCI,
-key-file, and sndio work continues.
-
-The important ordering is:
-
-```text
- open USB controller
-        |
-        v
- Intel controller setup / firmware
-        |
-        v
- raise scheduling priority if requested
-        |
-        v
- drop privileges to DOAS_USER
-        |
-        +--> resolve ~/.btspk_keys
-        |
-        +--> unveil filesystem paths
-        |
-        v
- start USB ioctl helper
-        |
-        v
- pledge main process
-        |
-        v
- HCI / L2CAP / AVDTP / A2DP
-        |
-        v
- sndio playback
-```
-
-Resolving the user's home directory before `unveil()` is intentional: once the
-filesystem policy is locked, the password database and unrelated filesystem
-paths are no longer available to the main process.
-
-## Pairing security
-
-The default pairing policy requires authenticated Secure Simple Pairing using
-Numeric Comparison. The user must explicitly confirm the displayed value.
-
-If the remote device cannot provide compatible Numeric Comparison
-capabilities, normal pairing is refused.
-
-### Just Works
-
-Some devices cannot perform Numeric Comparison. `-J` explicitly opts into
-Just Works pairing:
-
-```sh
-doas ./btspk -J -n 2 play 04:fe:a1:8c:3a:fb
-```
-
-Just Works does **not** provide MITM protection. `btspk` warns when `-J` is
-enabled. This option is intended for devices where authenticated Numeric
-Comparison is unavailable and the user accepts the weaker pairing security.
-
-`-J` and `-S` are mutually exclusive.
-
-### Diagnostic security bypass
-
-`-S` disables the normal authentication/encryption handling and is intended
-only for diagnostics. It should not be used for normal connections or with
-untrusted devices.
-
-```sh
-doas ./btspk -S -v -n 2 play 04:fe:a1:8c:3a:fb
-```
+`-J` and `-S` are mutually exclusive. A run using either option must not
+be described as having the default authenticated pairing protection.
 
 ## Link-key storage
 
-Authenticated link keys are stored in:
+Link keys are stored in `~/.btspk/keys`, not in a world-readable
+location.
 
-```text
-~/.btspk_keys
-```
+The source applies these protections:
 
-The file is created with a restrictive umask and is accepted only when it is a
-regular file owned by the current user with no group/other permission bits.
-The file size is also bounded.
+-   The containing directory is created with mode `0700` and checked for
+    ownership and group/other access.
+-   The key file is opened with `O_NOFOLLOW` and `O_NONBLOCK`.
+-   The opened object must be a regular file, owned by the effective
+    user, with no group/other permission bits and a bounded size.
+-   Only authenticated combination keys are loaded by default.
+    Unauthenticated key types are considered only when `-J` was
+    explicitly selected.
+-   Updates are written to a `mkstemp()` file, flushed, synchronized
+    with `fsync()`, and atomically renamed over the old file.
+-   The process sets `umask(077)`.
+-   Temporary key buffers and selected protocol/IPC buffers are cleared
+    with `explicit_bzero()`.
 
-Sensitive key material and temporary HCI buffers are explicitly cleared where
-appropriate with `explicit_bzero()`.
+The program does not intentionally persist link keys in the controller's
+stored-key database. When an unacceptable key is reported by the
+controller, the code issues a delete-stored-key command.
 
-## Requirements
+## Firmware input
 
-- OpenBSD.
-- An Intel Bluetooth USB controller supported by the firmware and USB
-  transport code. The example below uses an Intel AX201.
-- `libsbc`.
-- `sndio` / `sndiod`.
-- Permission to access the relevant `ugen(4)` device nodes.
+Firmware is opened with `O_NOFOLLOW`. The opened object must be a
+regular file and its size must not exceed `INTEL_FW_MAX_SIZE`. The
+firmware is read before the normal playback sandbox is installed, as
+part of privileged controller setup.
 
-`btspk` communicates with the USB controller directly through OpenBSD's USB
-interfaces. It does not use `libusb`.
+The controller's Intel secure-download mechanism is used for firmware
+acceptance. This source does not establish a host-side firmware hash
+allowlist or independently verify a firmware signature before sending
+it. Do not infer those protections from the use of the controller's
+secure-download command.
 
-## Install `libsbc`
+## Logging and sensitive data
 
-Install the port under `mystuff`:
+The verbose trace routine emits only HCI command and event records. It
+does not emit the raw ACL, AVDTP, bulk, audio, or firmware payload
+traces. Numeric confirmation and passkey-notification event data is
+truncated before logging. The code also explicitly clears a number of
+link-key, event, command, audio, and IPC buffers.
 
-```sh
-cd /usr/ports/mystuff/audio/libsbc
-make install clean
-```
+Verbose logging should still be reviewed before collecting logs for
+public bug reports; logs can contain Bluetooth addresses and other
+device metadata.
 
-## Intel firmware
+## Limits and review notes
 
-The Intel AX201 example uses:
+These controls reduce exposure, but they do not prove the program is
+free of memory-safety, protocol, logic, kernel, firmware, or hardware
+vulnerabilities. The USB helper is not pledged, and its safety depends
+on the correctness of its IPC validation and ioctl allowlist. The
+firmware trust decision ultimately depends on the controller's
+secure-download implementation and the firmware source.
 
-```text
-ibt-19-0-4.sfi
-```
+**Source review item for this v12 snapshot:** inspect `read_full()`
+before release. In the supplied source, the loop appears to call
+`read()` twice before checking the result. That can consume two chunks
+of an IPC record while advancing the buffer only once, which is
+inconsistent with the function's exact-read contract. This should be
+corrected and retested independently of the README.
 
-Inspect the controller:
+The program has not been certified by an external security auditor.
+Native OpenBSD compilation, runtime testing, controller compatibility
+testing, and pairing tests should be performed on the target system
+before release.
 
-```sh
-doas ./btspk info
-```
 
-Upload firmware as a standalone operation:
+## Command-line options
 
-```sh
-doas ./btspk -f ibt-19-0-4.sfi upload
-```
+`btspk` accepts options before the command. The available commands are
+`info`, `reset`, `scan`, `upload`, and `play`.
 
-Reset the controller into its bootloader state with:
-
-```sh
-doas ./btspk reset
-```
-
-After reset or firmware upload, the controller may re-enumerate under a
-different `ugen` unit. Check `dmesg` and use `-u` when necessary.
-
-For firmware images using the ECDSA header format, use `-E`:
-
-```sh
-doas ./btspk -E -f firmware.sfi upload
-```
-
-## Configure `sndiod`
-
-The default playback input is `snd/mon`.
-
-A working monitor configuration is:
-
-```sh
-doas rcctl set sndiod flags -s default -m mon -s mon
-doas rcctl restart sndiod
-```
-
-Inspect the available sndio devices with:
+### Usage
 
 ```sh
-sndioctl -d
+btspk [-EJSqv] [-f firmware.sfi] [-u unit] \
+    info | reset | scan | upload
+
+btspk [-JSqv] [-F ms] [-b ms] [-d device] [-n frames] \
+    [-u unit] play bdaddr
 ```
 
-The sandboxed sndiod connection uses the local Unix socket directory:
+`bdaddr` is the Bluetooth address of the A2DP audio sink, in the form
+`aa:bb:cc:dd:ee:ff`.
 
-```text
-/tmp/sndio
-```
+### Options
 
-## Usage
+| Option | Meaning |
+| --- | --- |
+| `-E` | Use the ECDSA firmware header format instead of the default RSA format when uploading Intel firmware. |
+| `-f firmware.sfi` | Path to the Intel `.sfi` firmware image. Required by the standalone `upload` command and when the controller needs firmware. |
+| `-u unit` | Select the OpenBSD `ugen` unit number for the Bluetooth USB device. Default: `0`. |
+| `-J` | Explicitly allow Just Works pairing. This has no MITM protection; see [Pairing and link security](#bluetooth-pairing-and-link-security). |
+| `-S` | Skip Bluetooth authentication and encryption. Diagnostic/compatibility mode only; it bypasses the normal link-security checks. |
+| `-q` | Quiet mode: suppress informational messages and non-fatal warnings. Fatal errors are still reported. |
+| `-v` | Enable verbose diagnostics. Trace output is limited to HCI command/event information; it does not dump raw audio or bulk payloads. |
+| `-F ms` | Set the controller connection flush timeout in milliseconds. Range: `0`–`1000`; `0` disables the timeout. Default: `100` ms. |
+| `-b ms` | Set the sndio capture buffer duration. Range: `10`–`60000` ms. Default: `30` ms. |
+| `-d device` | Select the sndio device. The playback path accepts `snd/` devices; default: `snd/mon`. |
+| `-n frames` | Number of SBC frames placed in each media packet. Range: `1`–`15`; default: `2`. |
 
-```text
-btspk [-EJSqv] [-f firmware.sfi] [-u unit] info | reset | scan | upload
-btspk [-JSqv] [-F ms] [-b ms] [-d device] [-n frames] [-u unit] play bdaddr
-```
+`-J` and `-S` cannot be used together. `-F`, `-b`, `-d`, and `-n` are
+playback settings. `-E` and `-f` are firmware settings.
 
-### Controller information
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `info` | Display Intel controller/firmware information. |
+| `reset` | Reset the Intel Bluetooth controller. |
+| `scan` | Perform Bluetooth device inquiry and report discovered devices. |
+| `upload` | Upload the specified Intel firmware image to the controller. Use `-f`; `-E` selects the ECDSA header format. |
+| `play bdaddr` | Connect to the specified Bluetooth A2DP sink, negotiate SBC audio, and stream audio through sndio. |
+
+### Examples
 
 ```sh
-doas ./btspk info
+# Show controller and firmware information
+doas btspk info
+
+# Scan for nearby Bluetooth devices
+doas btspk scan
+
+# Upload an Intel firmware image
+doas btspk -f ibt-XX.sfi upload
+
+# Play to an A2DP sink using the default sndio device
+doas btspk play 04:fe:a1:8c:3a:fb
+
+# Select the sndio device and use four SBC frames per packet
+doas btspk -d snd/0 -n 4 play 04:fe:a1:8c:3a:fb
+
+# Permit Just Works pairing for a device that cannot use Numeric Comparison
+doas btspk -J play 04:fe:a1:8c:3a:fb
 ```
 
-### Scan
+The last example deliberately weakens pairing security. Just Works does not
+protect against man-in-the-middle attacks.
 
-```sh
-doas ./btspk scan
-```
+## Build and usage
 
-### Play
+Build dependencies and exact invocation details depend on the target
+OpenBSD version and the installed Bluetooth/sndio development
+interfaces. Use the project's build instructions and verify the
+resulting binary on the target machine.
 
-```sh
-doas ./btspk -n 2 play 04:fe:a1:8c:3a:fb
-```
+## Security summary
 
-Select a different `sndio` device with `-d`:
+-   Privileged USB setup is separated from the normal unprivileged
+    protocol process.
+-   The main playback process drops privileges, uses `unveil()`, and
+    narrows `pledge()` promises.
+-   USB operations are brokered through a fixed, validated IPC
+    interface.
+-   Pairing defaults to Secure Simple Pairing / Secure Connections with
+    Numeric Comparison and MITM protection.
+-   Negotiated encryption key size is checked for a 128-bit minimum.
+-   Link keys are stored in a private, owner-checked file and updated
+    atomically.
+-   Firmware files are opened without following symlinks and
+    size-limited.
+-   Verbose tracing avoids dumping raw audio and protocol payloads.
 
-```sh
-doas ./btspk -d snd/mon -n 2 play 04:fe:a1:8c:3a:fb
-```
-
-The default SBC packetization is two frames per RTP media packet and the
-default sndio application buffer is 30 ms. Playback continues until
-interrupted with Ctrl-C.
-
-### Quiet mode
-
-`-q` suppresses informational and non-fatal warning output while leaving fatal
-errors visible.
-
-```sh
-doas ./btspk -q -n 2 play 04:fe:a1:8c:3a:fb
-```
-
-The Numeric Comparison confirmation prompt is still shown when required,
-because silently suppressing that prompt would defeat the explicit security
-confirmation.
-
-## Audio pipeline
-
-```text
- sndio / sndiod
-       |
-       | PCM
-       v
-   btspk audio path
-       |
-       | SBC
-       v
-    libsbc
-       |
-       | RTP media packets
-       v
- AVDTP / L2CAP
-       |
-       v
- Bluetooth ACL
-       |
-       v
-   A2DP device
-```
-
-The negotiated A2DP sample rate and SBC configuration determine the encoder
-parameters. `-n` controls the number of SBC frames placed in each media packet
-and `-b` controls the sndio application buffer size in milliseconds.
-
-## Filesystem and syscall sandbox summary
-
-| Component | Access |
-|---|---|
-| Main playback process | `pledge()` after setup; `unveil()` locked |
-| Link-key file | `$HOME/.btspk_keys` |
-| Numeric Comparison | `/dev/tty` during setup/pairing |
-| sndio/sndiod | `/tmp/sndio` Unix socket |
-| Raw `/dev/audio` | Not required for `snd/...` playback |
-| USB controller | Isolated through the USB helper |
-| USB helper | Unpledged, fixed IPC protocol, bounded USB operations |
-
-The design deliberately keeps the Bluetooth protocol implementation in the
-pledged main process while moving only the unavoidable `ugen(4)` ioctl surface
-into the small helper.
-
-## Project status
-
-This is a native OpenBSD userland Bluetooth A2DP implementation. The source
-is closely tied to OpenBSD interfaces such as `ugen(4)`, `pledge(2)`,
-`unveil(2)`, and `sndio(7)`.
+The `-J` and `-S` options deliberately weaken Bluetooth link security
+and must be considered when interpreting the protection provided by a
+particular run.
