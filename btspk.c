@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 
 #include <dev/usb/usb.h>
@@ -29,9 +30,8 @@
 #include <pthread.h>
 #include <pwd.h>
 #include <signal.h>
-#include <sys/socket.h>
-#include <stdint.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +73,7 @@
 #define HCI_OGF_LINK_CTL	0x01
 #define HCI_OGF_HOST_CTL	0x03
 #define HCI_OGF_INFO		0x04
+#define HCI_OGF_STATUS		0x05
 #define HCI_OGF_VENDOR		0x3f
 
 #define HCI_CMD_INQUIRY		HCI_OPCODE(HCI_OGF_LINK_CTL, 0x0001)
@@ -80,16 +81,21 @@
 #define HCI_CMD_DISCONNECT	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x0006)
 #define HCI_CMD_LINK_KEY_REPLY	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x000b)
 #define HCI_CMD_LINK_KEY_NEG	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x000c)
+#define HCI_CMD_DELETE_STORED_KEY	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x0012)
 #define HCI_CMD_AUTH_REQUESTED	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x0011)
 #define HCI_CMD_SET_ENCRYPTION	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x0013)
 #define HCI_CMD_REMOTE_NAME	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x0019)
 #define HCI_CMD_IO_CAP_REPLY	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x002b)
 #define HCI_CMD_USER_CONFIRM	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x002c)
+#define HCI_CMD_USER_CONFIRM_NEG	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x002d)
+#define HCI_CMD_PASSKEY_NEG	HCI_OPCODE(HCI_OGF_LINK_CTL, 0x002f)
 #define HCI_CMD_SET_EVENT_MASK	HCI_OPCODE(HCI_OGF_HOST_CTL, 0x0001)
 #define HCI_CMD_RESET		HCI_OPCODE(HCI_OGF_HOST_CTL, 0x0003)
 #define HCI_CMD_WRITE_FLUSH_TO	HCI_OPCODE(HCI_OGF_HOST_CTL, 0x0028)
 #define HCI_CMD_WRITE_SSP_MODE	HCI_OPCODE(HCI_OGF_HOST_CTL, 0x0056)
+#define HCI_CMD_WRITE_SECURE_CONNECTIONS	HCI_OPCODE(HCI_OGF_HOST_CTL, 0x007a)
 #define HCI_CMD_READ_BUF_SIZE	HCI_OPCODE(HCI_OGF_INFO, 0x0005)
+#define HCI_CMD_READ_ENCRYPTION_KEY_SIZE	HCI_OPCODE(HCI_OGF_STATUS, 0x0008)
 
 /* HCI events. */
 #define HCI_EVT_INQUIRY_DONE	0x01
@@ -107,6 +113,8 @@
 #define HCI_EVT_IO_CAP_REQ	0x31
 #define HCI_EVT_IO_CAP_RSP	0x32
 #define HCI_EVT_USER_CONFIRM	0x33
+#define HCI_EVT_USER_PASSKEY_REQ	0x34
+#define HCI_EVT_USER_PASSKEY_NOTIFY	0x3b
 #define HCI_EVT_SSP_COMPLETE	0x36
 #define HCI_EVT_VENDOR		0xff
 
@@ -128,13 +136,14 @@
 #define HCI_ENCRYPT_ON		0x01
 #define HCI_IO_DISPLAY_YES_NO	0x01
 #define HCI_IO_NO_INPUT_OUTPUT	0x03
+#define HCI_IO_KEYBOARD_DISPLAY	0x04
 #define HCI_OOB_NONE		0x00
 #define HCI_AUTH_BONDING_NOMITM	0x04	/* general bonding, no MITM */
 #define HCI_AUTH_BONDING_MITM	0x05	/* general bonding, MITM required */
 #define HCI_KEY_UNAUTH_COMBINATION	0x04
 #define HCI_KEY_AUTH_COMBINATION	0x05
-#define HCI_KEY_UNAUTH_COMBINATION_P256	0x08
-#define HCI_KEY_AUTH_COMBINATION_P256	0x09
+#define HCI_KEY_UNAUTH_COMBINATION_P256	0x07
+#define HCI_KEY_AUTH_COMBINATION_P256	0x08
 #define HCI_COD_MAJOR_AUDIO	0x04
 #define HCI_COD_MAJOR(cod)	(((cod) >> 8) & 0x1f)
 #define HCI_PKT_TYPES_ACL	0xcc18	/* DM1 DH1 DM3 DH3 DM5 DH5 */
@@ -400,9 +409,11 @@ static void	usb_helper_start(void);
 static void	usb_helper_loop(int);
 static int	usb_helper_call(struct usb_helper_msg *);
 static int	usb_hci_command_allowed(uint16_t, int);
+static void	check_rejected_key(void);
+static int	numeric_comparison_capable(int);
 static int	read_full(int, void *, size_t);
 static int	write_full(int, const void *, size_t);
-static void	pledge_main(const char *, int);
+static void	pledge_main(int);
 static void	usb_open(int);
 static void	usb_reopen(void);
 static void *	bulk_reader(void *);
@@ -430,7 +441,7 @@ static void	bulk_parse(void);
 static void	pump(int);
 static int	av_cmd(uint8_t, const uint8_t *, int, uint8_t *);
 static int	intel_version(int);
-static void	intel_boot_params(void);
+static int	intel_boot_params(void);
 static void	intel_fragment(uint8_t, const uint8_t *, size_t);
 static uint8_t *	firmware_read(const char *, size_t *);
 static void	intel_boot(const char *, int);
@@ -447,7 +458,7 @@ static void	stream(struct a2dp *, const char *, int, int);
 static void	play(const char *, const char *, int, int);
 static void	drop_privileges(void);
 static int	confirm_numeric(const uint8_t *);
-static void	sandbox(const char *, int);
+static void	sandbox(const char *);
 static void	onsig(int);
 static __dead void	usage(void);
 
@@ -560,6 +571,9 @@ static int command_done;
 static int connection_done;
 static int authentication_done;
 static int encryption_done;
+static int rejected_link_key;
+static int key_delete_done;
+static int key_delete_status;
 static int inquiry_done;
 static int remote_name_done;
 static int echo_reply_ready;
@@ -668,8 +682,12 @@ trace(const char *tag, unsigned int code, const uint8_t *p, int n)
 {
 	int i;
 
-	if (!verbose)
+	if (!verbose || (strcmp(tag, "cmd") != 0 &&
+	    strcmp(tag, "evt") != 0))
 		return;
+	if (code == HCI_EVT_USER_CONFIRM ||
+	    code == HCI_EVT_USER_PASSKEY_NOTIFY)
+		n = n > BDADDR_LEN ? BDADDR_LEN : n;
 	qfprintf(stderr, "%s %04x:", tag, code);
 	for (i = 0; i < n; i++)
 		qfprintf(stderr, " %02x", p[i]);
@@ -677,24 +695,36 @@ trace(const char *tag, unsigned int code, const uint8_t *p, int n)
 }
 
 /*
- * Link keys live in ~/.btspk_keys as address, key and HCI key type.
+ * Link keys live in ~/.btspk/keys as address, key and HCI key type.
  * Only authenticated combination keys are loaded; the file must belong
  * to us and be private, or it is not used.
  */
 
+static char key_dir[PATH_MAX];
 static char key_file[PATH_MAX];
 
-/* Resolve the key path before unveil() hides the password database. */
+/* Resolve the key path and create its private directory before unveil(). */
 static void
 keypath_init(void)
 {
 	struct passwd *pw;
+	struct stat st;
 
 	if ((pw = getpwuid(getuid())) == NULL || pw->pw_dir == NULL)
-		return;
-	if (snprintf(key_file, sizeof(key_file), "%s/.btspk_keys",
-	    pw->pw_dir) >= (int)sizeof(key_file))
-		key_file[0] = '\0';
+		errx(1, "cannot determine the user's home directory");
+	if (snprintf(key_dir, sizeof(key_dir), "%s/.btspk",
+	    pw->pw_dir) >= (int)sizeof(key_dir) ||
+	    snprintf(key_file, sizeof(key_file), "%s/keys",
+	    key_dir) >= (int)sizeof(key_file))
+		errx(1, "btspk key path is too long");
+
+	if (mkdir(key_dir, 0700) == -1 && errno != EEXIST)
+		err(1, "mkdir %s", key_dir);
+	if (stat(key_dir, &st) == -1)
+		err(1, "stat %s", key_dir);
+	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+	    (st.st_mode & (S_IRWXG | S_IRWXO)))
+		errx(1, "%s: directory must be private to the user", key_dir);
 }
 
 static const char *
@@ -1263,7 +1293,7 @@ l2cap_input(const uint8_t *pdu, int len)
 	msg = pdu + L2CAP_HDR_LEN;
 	plen = len - L2CAP_HDR_LEN;
 
-	if (len < L2CAP_HDR_LEN || get_le16(pdu) != plen)
+	if (len < L2CAP_HDR_LEN || get_le16(pdu) != (unsigned int)plen)
 		return;
 	cid = get_le16(pdu + 2);
 	if (cid == L2CAP_CID_SIGNALLING) {
@@ -1415,6 +1445,13 @@ is_acl_handle(const uint8_t *p)
 	return connected && (get_le16(p) & ACL_HANDLE_MASK) == acl_handle;
 }
 
+static int
+numeric_comparison_capable(int io)
+{
+	return io == HCI_IO_DISPLAY_YES_NO ||
+	    io == HCI_IO_KEYBOARD_DISPLAY;
+}
+
 static void
 handle_event(int code, const uint8_t *p, int n)
 {
@@ -1464,7 +1501,12 @@ handle_event(int code, const uint8_t *p, int n)
 	case HCI_EVT_ENCRYPT_CHANGE:
 		if (n < 4 || !is_acl_handle(p + 1))
 			break;
-		enc_status = p[0] ? p[0] : p[3] ? 0 : 0x100;
+		if (p[0] != HCI_STATUS_OK)
+			enc_status = p[0];
+		else if (p[3] == 0)
+			enc_status = 0x100;
+		else
+			enc_status = HCI_STATUS_OK;
 		encryption_done = 1;
 		break;
 	case HCI_EVT_CMD_COMPLETE:
@@ -1472,6 +1514,14 @@ handle_event(int code, const uint8_t *p, int n)
 			break;
 		op = get_le16(p + 1);
 		/* the Intel bootloader acks download fragments as opcode 0 */
+		if (op == HCI_CMD_DELETE_STORED_KEY) {
+			if (n < 6)
+				key_delete_status = -1;
+			else
+				key_delete_status = p[3];
+			key_delete_done = 1;
+			break;
+		}
 		if (op != waiting_opcode &&
 		    !(op == 0 && waiting_opcode == INTEL_CMD_SECURE_SEND))
 			break;
@@ -1481,7 +1531,7 @@ handle_event(int code, const uint8_t *p, int n)
 		command_done = 1;
 		break;
 	case HCI_EVT_CMD_STATUS:
-		if (n < 4 || get_le16(p + 2) != waiting_opcode)
+		if (n < 4 || get_le16(p + 2) != (unsigned int)waiting_opcode)
 			break;
 		command_status = p[0];
 		command_done = 1;
@@ -1508,7 +1558,7 @@ handle_event(int code, const uint8_t *p, int n)
 		op = p[BDADDR_LEN + HCI_LINK_KEY_LEN];
 		if ((op == HCI_KEY_AUTH_COMBINATION ||
 		    op == HCI_KEY_AUTH_COMBINATION_P256) &&
-		    remote_io_capability == HCI_IO_DISPLAY_YES_NO) {
+		    numeric_comparison_capable(remote_io_capability)) {
 			if (key_save(p, p + BDADDR_LEN, op))
 				qfprintf(stderr, "paired with MITM authentication; "
 				    "link key saved\n");
@@ -1525,9 +1575,17 @@ handle_event(int code, const uint8_t *p, int n)
 				qwarnx("paired without MITM protection (Just Works); "
 				    "link key was not saved");
 		} else {
+			uint8_t del[BDADDR_LEN + 1];
+
+			/* Do not leave a rejected key in the controller's store. */
+			memcpy(del, p, BDADDR_LEN);
+			del[BDADDR_LEN] = 0;
+			rejected_link_key = 1;
+			key_delete_done = 0;
+			key_delete_status = -1;
+			hci_cmd(HCI_CMD_DELETE_STORED_KEY, del, sizeof(del));
+			explicit_bzero(del, sizeof(del));
 			key_save(p, NULL, 0);
-			errx(1, "refusing to store an unauthenticated link key; "
-			    "use -J to explicitly allow Just Works pairing");
 		}
 		break;
 	case HCI_EVT_IO_CAP_RSP:
@@ -1547,6 +1605,21 @@ handle_event(int code, const uint8_t *p, int n)
 		hci_cmd(HCI_CMD_IO_CAP_REPLY, r, 9);
 		explicit_bzero(r, sizeof(r));
 		break;
+	case HCI_EVT_USER_PASSKEY_REQ:
+		if (n < BDADDR_LEN || !is_remote(p, n))
+			break;
+		/* No passkey-entry path is implemented. */
+		hci_cmd(HCI_CMD_PASSKEY_NEG, p, BDADDR_LEN);
+		errx(1, "refusing passkey-entry pairing; use a device "
+		    "that supports Numeric Comparison");
+		break;
+	case HCI_EVT_USER_PASSKEY_NOTIFY:
+		if (n < BDADDR_LEN + 4 || !is_remote(p, n))
+			break;
+		/* Never silently proceed with the passkey-entry model. */
+		errx(1, "refusing passkey-notification pairing; use a device "
+		    "that supports Numeric Comparison");
+		break;
 	case HCI_EVT_USER_CONFIRM:
 		if (n < BDADDR_LEN + 4 || !is_remote(p, n))
 			break;
@@ -1555,11 +1628,15 @@ handle_event(int code, const uint8_t *p, int n)
 			hci_cmd(HCI_CMD_USER_CONFIRM, p, BDADDR_LEN);
 			break;
 		}
-		if (remote_io_capability != HCI_IO_DISPLAY_YES_NO)
+		if (!numeric_comparison_capable(remote_io_capability)) {
+			hci_cmd(HCI_CMD_USER_CONFIRM_NEG, p, BDADDR_LEN);
 			errx(1, "refusing numeric comparison: incompatible "
 			    "pairing capabilities");
-		if (!confirm_numeric(p + BDADDR_LEN))
+		}
+		if (!confirm_numeric(p + BDADDR_LEN)) {
+			hci_cmd(HCI_CMD_USER_CONFIRM_NEG, p, BDADDR_LEN);
 			errx(1, "numeric comparison rejected; pairing aborted");
+		}
 		hci_cmd(HCI_CMD_USER_CONFIRM, p, BDADDR_LEN);
 		break;
 	case HCI_EVT_SSP_COMPLETE:
@@ -1775,7 +1852,8 @@ intel_version(int show)
 		return -1;
 	}
 	len = command_reply_len;
-	for (i = 1; i + 2 <= len && i + 2 + r[i + 1] <= len; i += 2 + r[i + 1]) {
+	for (i = 1; i + 2 <= len && i + 2 + r[i + 1] <= len;
+	    i += 2 + r[i + 1]) {
 		if (show) {
 			qprintf("tlv %02x len %d:", r[i], r[i + 1]);
 			for (j = 0; j < r[i + 1]; j++)
@@ -1809,7 +1887,7 @@ intel_version(int show)
 	return -1;
 }
 
-static void
+static int
 intel_boot_params(void)
 {
 	uint8_t *r;
@@ -1818,12 +1896,13 @@ intel_boot_params(void)
 	if (hci_cmd_wait(INTEL_CMD_READ_BOOT, NULL, 0) ||
 	    command_reply_len < INTEL_BOOT_LEN) {
 		qwarnx("could not read the boot parameters");
-		return;
+		return -1;
 	}
 	qfprintf(stderr, "boot params: dev_revid %u secure_boot %u "
 	    "key_type %u limited_cce %u\n", get_le16(r + INTEL_BOOT_DEV_REVID),
 	    r[INTEL_BOOT_SECURE], r[INTEL_BOOT_KEY_TYPE],
 	    r[INTEL_BOOT_LIMITED_CCE]);
+	return r[INTEL_BOOT_SECURE] != 0;
 }
 
 /*
@@ -1910,7 +1989,8 @@ intel_boot(const char *path, int ecdsa)
 	if (size < hdr)
 		errx(1, "%s: too small to be an Intel firmware file", path);
 
-	intel_boot_params();
+	if (intel_boot_params() != 1)
+		errx(1, "Intel secure boot is not enabled");
 	qfprintf(stderr, "loading %s (%zu bytes, %s header)\n", path, size,
 	    ecdsa ? "ECDSA" : "RSA");
 	vendor_secure_done = 0;
@@ -2045,7 +2125,6 @@ upload(const char *fw, int ecdsa)
 	intel_boot(fw, ecdsa);
 }
 
-/* Controller setup, scanning and the ACL link. */
 
 static void
 hci_init(void)
@@ -2055,22 +2134,35 @@ hci_init(void)
 	int i;
 
 	bulk_start();
-	hci_cmd_wait(HCI_CMD_RESET, NULL, 0);
+	if (hci_cmd_wait(HCI_CMD_RESET, NULL, 0) != HCI_STATUS_OK)
+		errx(1, "controller reset failed");
 
 	m = HCI_EVT_MASK_DEFAULT | HCI_EVT_BIT(HCI_EVT_IO_CAP_REQ) |
-	    HCI_EVT_BIT(HCI_EVT_IO_CAP_RSP) | HCI_EVT_BIT(HCI_EVT_USER_CONFIRM) |
+	    HCI_EVT_BIT(HCI_EVT_IO_CAP_RSP) |
+	    HCI_EVT_BIT(HCI_EVT_USER_CONFIRM) |
+	    HCI_EVT_BIT(HCI_EVT_USER_PASSKEY_REQ) |
+	    HCI_EVT_BIT(HCI_EVT_USER_PASSKEY_NOTIFY) |
 	    HCI_EVT_BIT(HCI_EVT_SSP_COMPLETE);
 	for (i = 0; i < HCI_EVT_MASK_LEN; i++)
 		p[i] = m >> (8 * i);
-	hci_cmd_wait(HCI_CMD_SET_EVENT_MASK, p, HCI_EVT_MASK_LEN);
+	if (hci_cmd_wait(HCI_CMD_SET_EVENT_MASK, p, HCI_EVT_MASK_LEN) !=
+	    HCI_STATUS_OK)
+		errx(1, "could not enable required HCI events");
 
 	p[0] = HCI_SSP_ENABLE;
-	if (hci_cmd_wait(HCI_CMD_WRITE_SSP_MODE, p, 1))
-		qwarnx("the controller refused Secure Simple Pairing");
+	if (hci_cmd_wait(HCI_CMD_WRITE_SSP_MODE, p, 1) != HCI_STATUS_OK)
+		errx(1, "controller refused Secure Simple Pairing; "
+		    "refusing to continue in insecure mode");
 
-	if (hci_cmd_wait(HCI_CMD_READ_BUF_SIZE, NULL, 0) != 0 ||
+	p[0] = 1;
+	if (hci_cmd_wait(HCI_CMD_WRITE_SECURE_CONNECTIONS, p, 1) !=
+	    HCI_STATUS_OK)
+		errx(1, "controller refused Secure Connections; refusing to "
+		    "continue in insecure mode");
+
+	if (hci_cmd_wait(HCI_CMD_READ_BUF_SIZE, NULL, 0) != HCI_STATUS_OK ||
 	    command_reply_len < 7)
-		return;
+		errx(1, "could not read valid controller buffer sizes");
 	acl_mtu = get_le16(command_reply + 1);
 	acl_credits_max = get_le16(command_reply + 4);
 	if (acl_mtu < HCI_ACL_MIN_LEN || acl_credits_max < 1)
@@ -2154,6 +2246,21 @@ disconnect(void)
 }
 
 static void
+check_rejected_key(void)
+{
+	if (!rejected_link_key)
+		return;
+	if (!wait_flag(&key_delete_done, TMO_CMD) || key_delete_status !=
+	    HCI_STATUS_OK) {
+		rejected_link_key = 0;
+		errx(1, "could not remove rejected link key from controller");
+	}
+	rejected_link_key = 0;
+	errx(1, "refusing an unauthenticated link key; "
+	    "use -J to explicitly allow Just Works pairing");
+}
+
+static void
 link_up(void)
 {
 	uint8_t p[13];
@@ -2192,6 +2299,7 @@ link_up(void)
 		    "Bluetooth button until it blinks, then run again",
 		    auth_status);
 	}
+	check_rejected_key();
 
 	put_le16(p, acl_handle);
 	p[2] = HCI_ENCRYPT_ON;
@@ -2200,7 +2308,14 @@ link_up(void)
 		errx(1, "encryption request refused");
 	if (!wait_flag(&encryption_done, TMO_ENCRYPT) || enc_status)
 		errx(1, "could not turn encryption on");
+	check_rejected_key();
+
+	if (hci_cmd_wait(HCI_CMD_READ_ENCRYPTION_KEY_SIZE, p, 2) !=
+	    HCI_STATUS_OK || command_reply_len < 4 ||
+	    command_reply[3] < HCI_LINK_KEY_LEN)
+		errx(1, "encryption key is shorter than 128 bits");
 	pump(TMO_LINK_SETUP);
+	check_rejected_key();
 }
 
 /* let the controller drop audio it cannot deliver in time */
@@ -2304,7 +2419,7 @@ a2dp_negotiate(struct a2dp *a)
 		errx(1, "the device would not open the stream");
 }
 
-/* Read audio from sndio, encode it and send it until interrupted. */
+/* Capture audio from sndiod, encode it and send it until interrupted. */
 
 static void
 stream(struct a2dp *a, const char *dev, int nframes, int bufms)
@@ -2355,6 +2470,8 @@ stream(struct a2dp *a, const char *dev, int nframes, int bufms)
 
 	if ((hdl = sio_open(dev, SIO_REC, 0)) == NULL)
 		errx(1, "cannot open sndio device %s", dev);
+	if (pledge("stdio unix audio", NULL) == -1)
+		err(1, "pledge stdio unix audio");
 	sio_initpar(&par);
 	par.bits = 16;
 	par.sig = 1;
@@ -2406,6 +2523,9 @@ stream(struct a2dp *a, const char *dev, int nframes, int bufms)
 	}
 	sio_close(hdl);
 	sbc_finish(&sbc);
+	explicit_bzero(out, sizeof(out));
+	explicit_bzero(pkt, sizeof(pkt));
+	explicit_bzero(pcm, want);
 	free(pcm);
 }
 
@@ -2481,24 +2601,15 @@ confirm_numeric(const uint8_t *p)
 
 /* Restrict filesystem access after USB setup and privilege dropping. */
 static void
-sandbox(const char *dev, int play_mode)
+sandbox(const char *dev)
 {
-	struct passwd *pw;
-
-	if ((pw = getpwuid(getuid())) == NULL || pw->pw_dir == NULL)
-		errx(1, "cannot determine the user's home directory");
-	if (unveil(pw->pw_dir, "rwc") == -1)
-		err(1, "unveil %s", pw->pw_dir);
+	if (unveil(key_dir, "rwc") == -1)
+		err(1, "unveil %s", key_dir);
 	if (unveil("/dev/tty", "rw") == -1)
 		err(1, "unveil /dev/tty");
-	if (play_mode && strncmp(dev, "snd/", 4) == 0) {
-		/* sndiod's Unix socket is /tmp/sndio/sock0 on this system. */
-		if (unveil("/tmp/sndio", "w") == -1)
-			err(1, "unveil /tmp/sndio (sndio device %s)", dev);
-	} else if (play_mode && strncmp(dev, "rsnd/", 5) == 0) {
-		if (unveil("/dev/audio", "rw") == -1)
-			err(1, "unveil /dev/audio");
-	}
+	/* sndio connects to sndiod through its Unix-domain socket. */
+	if (unveil("/tmp/sndio", "w") == -1)
+		err(1, "unveil /tmp/sndio (sndio device %s)", dev);
 	if (unveil(NULL, NULL) == -1)
 		err(1, "unveil lock");
 }
@@ -2540,7 +2651,6 @@ write_full(int fd, const void *buf, size_t len)
 	return 0;
 }
 
-/* Send one validated request to the USB ioctl broker. */
 static int
 usb_helper_call(struct usb_helper_msg *msg)
 {
@@ -2578,7 +2688,7 @@ usb_do_request(struct usb_ctl_request *ur)
 
 	memset(&msg, 0, sizeof(msg));
 	len = UGETW(ur->ucr_request.wLength);
-	if (len < 0 || len > (int)sizeof(msg.data) ||
+	if (len > (int)sizeof(msg.data) ||
 	    (len != 0 && ur->ucr_data == NULL)) {
 		errno = EINVAL;
 		return -1;
@@ -2592,7 +2702,6 @@ usb_do_request(struct usb_ctl_request *ur)
 	return usb_helper_call(&msg);
 }
 
-/* Only the three ugen bulk configuration ioctls are brokered. */
 static int
 usb_bulk_ioctl(unsigned long request, int *value)
 {
@@ -2607,7 +2716,6 @@ usb_bulk_ioctl(unsigned long request, int *value)
 	return usb_helper_call(&msg);
 }
 
-/* Allow only HCI commands used by the normal scan and playback paths. */
 static int
 usb_hci_command_allowed(uint16_t op, int len)
 {
@@ -2622,6 +2730,8 @@ usb_hci_command_allowed(uint16_t op, int len)
 		return len == BDADDR_LEN + HCI_LINK_KEY_LEN;
 	case HCI_CMD_LINK_KEY_NEG:
 		return len == BDADDR_LEN;
+	case HCI_CMD_DELETE_STORED_KEY:
+		return len == BDADDR_LEN + 1;
 	case HCI_CMD_AUTH_REQUESTED:
 		return len == 2;
 	case HCI_CMD_SET_ENCRYPTION:
@@ -2631,6 +2741,8 @@ usb_hci_command_allowed(uint16_t op, int len)
 	case HCI_CMD_IO_CAP_REPLY:
 		return len == 9;
 	case HCI_CMD_USER_CONFIRM:
+	case HCI_CMD_USER_CONFIRM_NEG:
+	case HCI_CMD_PASSKEY_NEG:
 		return len == BDADDR_LEN;
 	case HCI_CMD_SET_EVENT_MASK:
 		return len == HCI_EVT_MASK_LEN;
@@ -2640,7 +2752,10 @@ usb_hci_command_allowed(uint16_t op, int len)
 	case HCI_CMD_WRITE_FLUSH_TO:
 		return len == 4;
 	case HCI_CMD_WRITE_SSP_MODE:
+	case HCI_CMD_WRITE_SECURE_CONNECTIONS:
 		return len == 1;
+	case HCI_CMD_READ_ENCRYPTION_KEY_SIZE:
+		return len == 2;
 	default:
 		return 0;
 	}
@@ -2737,6 +2852,9 @@ usb_helper_start(void)
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, sv) == -1)
 		err(1, "socketpair USB helper");
+	if (fcntl(sv[0], F_SETFD, FD_CLOEXEC) == -1 ||
+	    fcntl(sv[1], F_SETFD, FD_CLOEXEC) == -1)
+		err(1, "fcntl USB helper");
 	if ((pid = fork()) == -1) {
 		close(sv[0]);
 		close(sv[1]);
@@ -2752,15 +2870,17 @@ usb_helper_start(void)
 	fd_control = -1;
 }
 
-/* Pledge the protocol/audio process after all path and USB setup is done. */
+/* Pledge the protocol process after all path and USB setup is done. */
 static void
-pledge_main(const char *dev, int play_mode)
+pledge_main(int play_mode)
 {
 	const char *promises;
 
-	promises = "stdio rpath wpath cpath unix tty";
-	if (play_mode && strncmp(dev, "rsnd/", 5) == 0)
+	if (play_mode)
+		/* sio_open() needs the audio promise even for sndiod devices. */
 		promises = "stdio rpath wpath cpath unix tty audio";
+	else
+		promises = "stdio unix";
 	if (pledge(promises, NULL) == -1)
 		err(1, "pledge %s", promises);
 }
@@ -2777,8 +2897,10 @@ drop_privileges(void)
 	struct passwd *pw;
 	const char *user;
 
-	if (geteuid() != 0 || (user = getenv("DOAS_USER")) == NULL)
+	if (geteuid() != 0)
 		return;
+	if ((user = getenv("DOAS_USER")) == NULL)
+		errx(1, "must be run through doas when invoked as root");
 	if ((pw = getpwnam(user)) == NULL)
 		errx(1, "%s: unknown user", user);
 	if (initgroups(pw->pw_name, pw->pw_gid) == -1 ||
@@ -2799,10 +2921,10 @@ static __dead void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: btspk [-EJSqv] [-f firmware.sfi] [-u unit] "
+	    "usage: %s [-EJSqv] [-f firmware.sfi] [-u unit] "
 	    "info | reset | scan | upload\n"
-	    "       btspk [-JSqv] [-F ms] [-b ms] [-d device] [-n frames] "
-	    "[-u unit] play bdaddr\n");
+	    "       %s [-JSqv] [-F ms] [-b ms] [-d device] [-n frames] "
+	    "[-u unit] play bdaddr\n", getprogname(), getprogname());
 	exit(1);
 }
 
@@ -2877,6 +2999,8 @@ main(int argc, char *argv[])
 		usage();
 	if (skip_security && allow_just_works)
 		errx(1, "-J and -S are mutually exclusive");
+	if (strcmp(argv[0], "play") == 0 && strncmp(dev, "snd/", 4) != 0)
+		errx(1, "unsupported sndio device %s (use snd/)", dev);
 
 	if (allow_just_works)
 		qwarnx("-J enabled: Just Works pairing has no MITM protection");
@@ -2918,10 +3042,12 @@ main(int argc, char *argv[])
 	if (strcmp(argv[0], "play") == 0)
 		setpriority(PRIO_PROCESS, 0, STREAM_NICE);
 	drop_privileges();
-	keypath_init();
-	sandbox(dev, strcmp(argv[0], "play") == 0);
+	if (strcmp(argv[0], "play") == 0) {
+		keypath_init();
+		sandbox(dev);
+	}
 	usb_helper_start();
-	pledge_main(dev, strcmp(argv[0], "play") == 0);
+	pledge_main(strcmp(argv[0], "play") == 0);
 
 	hci_init();
 	if (strcmp(argv[0], "scan") == 0 && argc == 1)
