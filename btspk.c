@@ -400,6 +400,7 @@ static FILE *	key_fopen(const char *);
 static int	key_load(const uint8_t *, uint8_t *);
 static int	key_save(const uint8_t *, const uint8_t *, int);
 static void	keypath_init(void);
+static void	sndio_dir_init(void);
 static void	set_timeout(int);
 static void	usb_open_endpoints(void);
 static void	usb_clear_halt(int);
@@ -725,6 +726,43 @@ keypath_init(void)
 	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
 	    (st.st_mode & (S_IRWXG | S_IRWXO)))
 		errx(1, "%s: directory must be private to the user", key_dir);
+}
+
+static void
+sndio_dir_init(void)
+{
+	struct passwd *pw;
+	struct stat st;
+	char path[PATH_MAX];
+	const char *user;
+	int created = 0;
+
+	if (geteuid() == 0) {
+		if ((user = getenv("DOAS_USER")) == NULL ||
+		    (pw = getpwnam(user)) == NULL)
+			errx(1, "cannot determine the target user");
+	} else {
+		if ((pw = getpwuid(getuid())) == NULL)
+			errx(1, "cannot determine the user's home directory");
+	}
+	if (pw->pw_dir == NULL || snprintf(path, sizeof(path),
+	    "%s/.sndio", pw->pw_dir) >= (int)sizeof(path))
+		errx(1, "sndio path is too long");
+	if (lstat(path, &st) == -1) {
+		if (errno != ENOENT)
+			err(1, "lstat %s", path);
+		if (mkdir(path, 0700) == -1)
+			err(1, "mkdir %s", path);
+		created = 1;
+		if (lstat(path, &st) == -1)
+			err(1, "lstat %s", path);
+	}
+	if (created && geteuid() == 0 && chown(path, pw->pw_uid, pw->pw_gid) == -1)
+		err(1, "chown %s", path);
+	if (created && geteuid() == 0 && lstat(path, &st) == -1)
+		err(1, "lstat %s", path);
+	if (!S_ISDIR(st.st_mode) || st.st_uid != pw->pw_uid)
+		errx(1, "%s: directory must be owned by the user", path);
 }
 
 static const char *
@@ -2603,6 +2641,17 @@ confirm_numeric(const uint8_t *p)
 static void
 sandbox(const char *dev)
 {
+	struct passwd *pw;
+	char path[PATH_MAX];
+
+	if ((pw = getpwuid(getuid())) == NULL || pw->pw_dir == NULL)
+		err(1, "cannot determine the user's home directory");
+	/* sndio_dir_init() prepares this directory before dropping privileges. */
+	if (snprintf(path, sizeof(path), "%s/.sndio", pw->pw_dir) >=
+	    (int)sizeof(path))
+		errx(1, "sndio path is too long");
+	if (unveil(path, "rwc") == -1)
+		err(1, "unveil %s", path);
 	if (unveil(key_dir, "rwc") == -1)
 		err(1, "unveil %s", key_dir);
 	if (unveil("/dev/tty", "rw") == -1)
@@ -3039,8 +3088,10 @@ main(int argc, char *argv[])
 		errx(1, "not an Intel controller");
 
 	/* the priority has to be raised while we are still root */
-	if (strcmp(argv[0], "play") == 0)
+	if (strcmp(argv[0], "play") == 0) {
 		setpriority(PRIO_PROCESS, 0, STREAM_NICE);
+		sndio_dir_init();
+	}
 	drop_privileges();
 	if (strcmp(argv[0], "play") == 0) {
 		keypath_init();
