@@ -5,10 +5,9 @@ controllers. It uses the USB interface exposed by OpenBSD, implements
 the required Bluetooth control and audio protocols in userland, and
 sends audio through `sndio`.
 
-This document describes the security mechanisms present in
-`btspk-secure-hardened-v12.c`. It is a description of that source
-revision, not a security certification or a claim that every path has
-been audited.
+This document describes the security mechanisms implemented by
+`btspk`. It is not a security certification or a claim that every
+code path has been audited.
 
 ## Security model
 
@@ -37,7 +36,7 @@ fixed IPC protocol and validation before issuing ioctls.
 The following diagram shows the intended privilege and syscall
 boundaries in the playback path.
 
-``` mermaid
+```mermaid
 flowchart TD
     A["Initial process<br/>root when invoked through doas"] --> B["USB open and Intel setup<br/>firmware handling if needed"]
     B --> C["Prepare ~/.sndio"]
@@ -280,18 +279,16 @@ on the correctness of its IPC validation and ioctl allowlist. The
 firmware trust decision ultimately depends on the controller's
 secure-download implementation and the firmware source.
 
-**Source review item for this v12 snapshot:** inspect `read_full()`
-before release. In the supplied source, the loop appears to call
-`read()` twice before checking the result. That can consume two chunks
-of an IPC record while advancing the buffer only once, which is
-inconsistent with the function's exact-read contract. This should be
-corrected and retested independently of the README.
+**Source review item:** inspect `read_full()` before release. Ensure
+that each loop iteration performs only one `read()` call, handles
+`EINTR` and end-of-file correctly, and advances the buffer only by the
+number of bytes actually read. This is important because the function
+handles fixed-size IPC records.
 
 The program has not been certified by an external security auditor.
 Native OpenBSD compilation, runtime testing, controller compatibility
 testing, and pairing tests should be performed on the target system
 before release.
-
 
 ## Command-line options
 
