@@ -362,13 +362,6 @@ doas btspk -J play 04:fe:a1:8c:3a:fb
 The last example deliberately weakens pairing security. Just Works does not
 protect against man-in-the-middle attacks.
 
-## Build and usage
-
-Build dependencies and exact invocation details depend on the target
-OpenBSD version and the installed Bluetooth/sndio development
-interfaces. Use the project's build instructions and verify the
-resulting binary on the target machine.
-
 ## Security summary
 
 -   Privileged USB setup is separated from the normal unprivileged
